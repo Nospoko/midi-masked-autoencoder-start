@@ -40,13 +40,12 @@ def denormalize_velocity(velocity: np.ndarray):
 
 
 def denormalize_time_features(time_feature: np.ndarray, mean: float, std: float):
-    time_feature = std * time_feature + mean
-    return 2**time_feature - 1e-8
+    return std * time_feature + mean
 
 
 def to_midi_piece(
     pitch: np.ndarray,
-    dstart: np.ndarray,
+    start: np.ndarray,
     duration: np.ndarray,
     velocity: np.ndarray,
     mask: np.ndarray = None,
@@ -54,13 +53,13 @@ def to_midi_piece(
     record = {
         "pitch": pitch,
         "velocity": velocity,
-        "dstart": dstart.astype("float"),
+        "start": start.astype("float"),
         "duration": duration.astype("float"),
         "mask": mask,
     }
 
     df = pd.DataFrame(record)
-    df["start"] = df.dstart.cumsum().shift(1).fillna(0)
+    # df["start"] = df.start.cumsum().shift(1).fillna(0)
     df["end"] = df.start + df.duration
 
     return ff.MidiPiece(df)
@@ -136,14 +135,10 @@ def main():
 
     idxs = part_df.index.values
     part_dataset = dataset.select(idxs)
-    midi_dataset = MidiDataset(part_dataset, use_dstart_log_normalization=cfg.train.use_dstart_log_normalization)
+    midi_dataset = MidiDataset(part_dataset)
 
-    if cfg.train.use_dstart_log_normalization:
-        mean_dstart = midi_dataset.mean_dstart
-        std_dstart = midi_dataset.std_dstart
-    else:
-        mean_dstart = None
-        std_dstart = None
+    mean_start = midi_dataset.mean_start
+    std_start = midi_dataset.std_start
 
     masking_ratio = st.number_input(
         label="Masking ratio",
@@ -155,8 +150,8 @@ def main():
         midi_dataset=midi_dataset,
         model=model,
         masking_ratio=masking_ratio,
-        mean_dstart=mean_dstart,
-        std_dstart=std_dstart,
+        mean_start=mean_start,
+        std_start=std_start,
     )
 
     for processing_result in generated_pieces:
@@ -168,8 +163,8 @@ def generate_pieces(
     midi_dataset: MidiDataset,
     model: MidiMaskedAutoencoder,
     masking_ratio: float,
-    mean_dstart: float = None,
-    std_dstart: float = None,
+    mean_start: float = None,
+    std_start: float = None,
 ):
     dataloader = DataLoader(midi_dataset, batch_size=256, shuffle=True)
 
@@ -177,13 +172,13 @@ def generate_pieces(
     for batch in dataloader:
         pitches = batch["pitch"].to(device)
         velocities = batch["velocity"].to(device)
-        dstarts = batch["dstart"].to(device)
+        starts = batch["start"].to(device)
         durations = batch["duration"].to(device)
 
-        pred_pitches, pred_velocities, pred_dstarts, pred_durations, mask = model(
+        pred_pitches, pred_velocities, pred_starts, pred_durations, mask = model(
             pitch=pitches,
             velocity=velocities,
-            dstart=dstarts,
+            start=starts,
             duration=durations,
             masking_ratio=masking_ratio,
         )
@@ -194,18 +189,18 @@ def generate_pieces(
 
         gen_pitches = torch.where(mask, pred_pitches, pitches)
         gen_velocities = torch.where(mask, pred_velocities, velocities)
-        gen_dstarts = torch.where(mask, pred_dstarts, dstarts)
+        gen_starts = torch.where(mask, pred_starts, starts)
         gen_durations = torch.where(mask, pred_durations, durations)
 
         generated_pieces += decode_batch(
             batch=batch,
             gen_pitches=gen_pitches,
             gen_velocities=gen_velocities,
-            gen_dstarts=gen_dstarts,
+            gen_starts=gen_starts,
             gen_durations=gen_durations,
             mask=mask,
-            mean_dstart=mean_dstart,
-            std_dstart=std_dstart,
+            mean_start=mean_start,
+            std_start=std_start,
         )
 
     return generated_pieces
@@ -215,16 +210,16 @@ def decode_batch(
     batch: torch.Tensor,
     gen_pitches: torch.Tensor,
     gen_velocities: torch.Tensor,
-    gen_dstarts: torch.Tensor,
+    gen_starts: torch.Tensor,
     gen_durations: torch.Tensor,
     mask: torch.Tensor,
-    mean_dstart: float = None,
-    std_dstart: float = None,
+    mean_start: float = None,
+    std_start: float = None,
 ):
     sources = batch["source"]
     pitches = batch["pitch"].to(device)
     velocities = batch["velocity"].to(device)
-    dstarts = batch["dstart"].to(device)
+    starts = batch["start"].to(device)
     durations = batch["duration"].to(device)
 
     batch_size = pitches.shape[0]
@@ -233,25 +228,24 @@ def decode_batch(
     for it in range(batch_size):
         pitch = pitches[it].cpu().numpy() + 21
         velocity = velocities[it].cpu().numpy()
-        dstart = dstarts[it].cpu().numpy()
+        start = starts[it].cpu().numpy()
         duration = durations[it].cpu().numpy()
 
         gen_pitch = gen_pitches[it].cpu().numpy() + 21
         gen_velocity = gen_velocities[it].cpu().numpy()
-        gen_dstart = gen_dstarts[it].cpu().numpy()
+        gen_start = gen_starts[it].cpu().numpy()
         gen_duration = gen_durations[it].cpu().numpy()
 
         m = mask[it].cpu().numpy()
 
         velocity = denormalize_velocity(velocity)
         gen_velocity = denormalize_velocity(gen_velocity)
+        
+        start = denormalize_time_features(start, mean=mean_start, std=std_start)
+        gen_start = denormalize_time_features(gen_start, mean=mean_start, std=std_start)
 
-        if mean_dstart is not None and std_dstart is not None:
-            dstart = denormalize_time_features(dstart, mean=mean_dstart, std=std_dstart)
-            gen_dstart = denormalize_time_features(gen_dstart, mean=mean_dstart, std=std_dstart)
-
-        original_piece = to_midi_piece(pitch, dstart, duration, velocity, mask=m)
-        model_piece = to_midi_piece(gen_pitch, gen_dstart, gen_duration, gen_velocity, mask=m)
+        original_piece = to_midi_piece(pitch, start, duration, velocity, mask=m)
+        model_piece = to_midi_piece(gen_pitch, gen_start, gen_duration, gen_velocity, mask=m)
 
         processing_result = {
             "original": original_piece,

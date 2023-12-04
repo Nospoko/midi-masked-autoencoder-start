@@ -6,10 +6,10 @@ from tqdm import tqdm
 import torch.optim as optim
 import torch.nn.functional as F
 from omegaconf import OmegaConf
-import torchmetrics.functional as M
 from huggingface_hub import upload_file
 from torch.utils.data import Subset, DataLoader
 from datasets import load_dataset, concatenate_datasets
+import torchmetrics.functional as M
 
 import wandb
 from data.dataset import MidiDataset
@@ -17,6 +17,10 @@ from models.mae import MidiMaskedAutoencoder
 from models.gradnorm import GradNormLossWeighter
 from models.scheduler import MaskingRatioScheduler
 
+
+def r2_score(pred: torch.Tensor, target: torch.Tensor):
+    # shapes: [batch_size, seq_len]
+    pass
 
 def makedir_if_not_exists(dir: str):
     if not os.path.exists(dir):
@@ -116,10 +120,11 @@ def forward_step(
     # shape: [num_losses, ]
     losses = torch.stack([pitch_loss, velocity_loss, start_loss, duration_loss])
 
-    pitch_acc = M.accuracy(pred_pitch, pitch, task="multiclass", num_classes=88)
-    velocity_r2 = M.r2_score(pred_velocity, velocity)
-    start_r2 = M.r2_score(pred_start, start)
-    duration_r2 = M.r2_score(pred_duration, duration)
+    mask_idx = mask.to(torch.bool)
+    pitch_acc = (torch.argmax(pred_pitch, dim=1)[mask_idx] == pitch[mask_idx]).float().mean()
+    velocity_r2 = M.r2_score(pred_velocity[mask_idx], velocity[mask_idx])
+    start_r2 = M.r2_score(pred_start[mask_idx], start[mask_idx])
+    duration_r2 = M.r2_score(pred_duration[mask_idx], duration[mask_idx])
 
     return losses, pitch_loss, velocity_loss, start_loss, duration_loss, pitch_acc, velocity_r2, start_r2, duration_r2
 
