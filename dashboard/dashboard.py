@@ -1,5 +1,6 @@
 import json
 from glob import glob
+import random
 
 import torch
 import numpy as np
@@ -20,32 +21,38 @@ device = "cpu"
 def display_pianoroll(processing_result: dict):
     st.json(processing_result["source"], expanded=False)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         st.write("### Original")
         from_fortepyan(processing_result["original"])
-        fig = ff.view.draw_dual_pianoroll(processing_result["original"])
-        st.pyplot(fig)
+        # fig = ff.view.draw_dual_pianoroll(processing_result["original"])
+        # st.pyplot(fig)
 
     with col2:
+        st.write("### Masked")
+        record = processing_result["original"]
+        mask = record.df["mask"]
+        df = record.df[~mask]
+        from_fortepyan(ff.MidiPiece(df=df, source=record.source))
+        # fig = ff.view.draw_dual_pianoroll(processing_result["generated"])
+        # st.pyplot(fig)
+    with col3:
         st.write("### Generated")
         from_fortepyan(processing_result["generated"])
-        fig = ff.view.draw_dual_pianoroll(processing_result["generated"])
-        st.pyplot(fig)
 
 
 def denormalize_velocity(velocity: np.ndarray):
     return ((velocity + 1) * 64).astype("int")
 
-
 def denormalize_time_features(time_feature: np.ndarray, mean: float, std: float):
-    return std * time_feature + mean
+    time_feature = std * time_feature + mean
+    return 2 ** time_feature - 1e-8
 
 
 def to_midi_piece(
     pitch: np.ndarray,
-    start: np.ndarray,
+    dstart: np.ndarray,
     duration: np.ndarray,
     velocity: np.ndarray,
     mask: np.ndarray = None,
@@ -53,13 +60,13 @@ def to_midi_piece(
     record = {
         "pitch": pitch,
         "velocity": velocity,
-        "start": start.astype("float"),
+        "dstart": dstart.astype("float"),
         "duration": duration.astype("float"),
         "mask": mask,
     }
 
     df = pd.DataFrame(record)
-    # df["start"] = df.start.cumsum().shift(1).fillna(0)
+    df["start"] = df.dstart.cumsum().shift(1).fillna(0)
     df["end"] = df.start + df.duration
 
     return ff.MidiPiece(df)
@@ -98,10 +105,52 @@ def model_selection() -> MidiMaskedAutoencoder:
 
 
 @st.cache_data
-def get_dataset() -> Dataset:
-    dataset_name = "JasiekKaczmarczyk/maestro-v1-sustain-masked"
-    dataset = load_dataset(dataset_name, split="validation")
+def get_dataset(dataset_name: str) -> Dataset:
+    # dataset_name = "JasiekKaczmarczyk/maestro-v1-sustain-masked"
+    dataset = load_dataset(dataset_name, split="train")
+
+    # available_splits = list(dataset.keys())
+    # split = st.selectbox("Choose split", options=available_splits)
+
     return dataset
+
+def slice_records(records: list[ff.MidiPiece], window_size: int):
+    sliced_records = []
+
+    for record in records:
+        n_samples = 1 + (record.size - window_size) // window_size
+        for it in range(n_samples):
+            start = it * window_size
+            finish = start + window_size
+            part = record[start:finish]
+
+            sliced_records.append(part)
+
+    return sliced_records
+
+def generate_midi_sequence(records: list[ff.MidiPiece]):
+    sequences = []
+
+    for record in records:
+        midi_filename = "tmp"
+        record.df["next_start"] = record.df.start.shift(-1)
+        record.df["dstart"] = record.df.next_start - record.df.start
+        record.df["dstart"] = record.df["dstart"].fillna(0)
+
+        sequence = {
+            "midi_filename": midi_filename,
+            "source": json.dumps(record.source),
+            "pitch": record.df.pitch.astype("int16").values,
+            "start": record.df.start.astype("float32").values,
+            "dstart": record.df.dstart.astype("float32").values,
+            "duration": record.df.duration.astype("float32").values,
+            "velocity": record.df.velocity.astype("int16").values,
+        }
+
+        sequences.append(sequence)
+
+    
+    return Dataset.from_list(sequences)
 
 
 def main():
@@ -109,7 +158,11 @@ def main():
     model, cfg = model_selection()
 
     # Prep data
-    dataset = get_dataset()
+    dataset_name = st.selectbox(
+        label="Select dataset",
+        options=["roszcz/maestro-sustain-v2", "roszcz/giant-midi-sustain-v2"],
+    )
+    dataset = get_dataset(dataset_name)
     source = [json.loads(source) for source in dataset["source"]]
     source_df = pd.DataFrame(source)
 
@@ -127,31 +180,46 @@ def main():
         options=piece_titles,
     )
     st.write(selected_title)
-
-    ids = (source_df.composer == selected_composer) & (source_df.title == selected_title)
-    n_samples = 10
-    seed = 137
-    part_df = source_df[ids].sample(n_samples, random_state=seed)
-
-    idxs = part_df.index.values
-    part_dataset = dataset.select(idxs)
-    midi_dataset = MidiDataset(part_dataset)
-
-    mean_start = midi_dataset.mean_start
-    std_start = midi_dataset.std_start
-
     masking_ratio = st.number_input(
         label="Masking ratio",
         min_value=0.05,
         max_value=1.0,
         value=0.5,
     )
+
+    ids = (source_df.composer == selected_composer) & (source_df.title == selected_title)
+    part_df = source_df[ids]
+    part_dataset = dataset.select(part_df.index.values)
+    records = []
+
+    for ds in part_dataset:
+        record = ff.MidiPiece.from_huggingface(ds)
+        records.append(record)
+
+    display_option = st.select_slider("Display type:", ["Random Windows", "Specific window"])
+
+    if display_option == "Random Windows":
+        num_displayed_records = st.number_input(label="Number of displayed records", min_value=1, value=10)
+        window_size = st.number_input(label="Number of notes in each window", min_value=16, value=128)
+
+        sliced_records = slice_records(records, window_size=window_size)
+        sampled_records = random.sample(sliced_records, k=num_displayed_records)
+    else:
+        start_note = st.number_input("Start note", value=0)
+        window_size = st.number_input(label="Number of notes in window", min_value=16, value=128)
+
+        sampled_records = [records[0][start_note : start_note + window_size]]
+
+    midi_sequences = generate_midi_sequence(sampled_records)
+    
+    midi_dataset = MidiDataset(midi_sequences)
+
     generated_pieces = generate_pieces(
         midi_dataset=midi_dataset,
         model=model,
         masking_ratio=masking_ratio,
-        mean_start=mean_start,
-        std_start=std_start,
+        mean_start=midi_dataset.mean_start,
+        std_start=midi_dataset.std_start,
     )
 
     for processing_result in generated_pieces:
